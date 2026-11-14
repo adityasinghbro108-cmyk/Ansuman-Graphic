@@ -189,4 +189,3 @@ def assistant_response(message, context, print_areas):
     if not isinstance(reply, str):
         reply = "I could not prepare a response. Please try again."
     return {"mode": "ai", "reply": reply[:1200], "actions": clean}
-

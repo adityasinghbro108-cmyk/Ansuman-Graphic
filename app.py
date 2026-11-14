@@ -3,6 +3,8 @@ import os
 import re
 import secrets
 import sqlite3
+import math
+from io import BytesIO
 from datetime import datetime
 from pathlib import Path
 from functools import wraps
@@ -10,15 +12,17 @@ from hmac import compare_digest
 
 from contextlib import closing
 
-from flask import Flask, abort, flash, g, jsonify, redirect, render_template, request, send_from_directory, session, url_for
+from flask import Flask, abort, flash, g, jsonify, redirect, render_template, request, send_file, send_from_directory, session, url_for
 from PIL import Image, UnidentifiedImageError
 from werkzeug.security import check_password_hash, generate_password_hash
 from werkzeug.utils import secure_filename
 from studio_assistant import AssistantError, assistant_response
+from print_artwork import MissingPrintAsset, artwork_filename, group_artworks, print_spec, render_print_png
 
 BASE_DIR = Path(__file__).resolve().parent
-DATABASE = BASE_DIR / "database" / "ansuman_graphic.sqlite3"
-UPLOAD_DIR = BASE_DIR / "uploads"
+DATABASE = Path(os.environ.get("ANSUMAN_DATABASE_PATH", BASE_DIR / "database" / "ansuman_graphic.sqlite3")).expanduser().resolve()
+UPLOAD_DIR = Path(os.environ.get("ANSUMAN_UPLOAD_DIR", BASE_DIR / "uploads")).expanduser().resolve()
+IS_RENDER = os.environ.get("RENDER", "").lower() == "true"
 ALLOWED_EXTENSIONS = {"png", "jpg", "jpeg"}
 MAX_UPLOAD_BYTES = 12 * 1024 * 1024
 MAX_READY_UPLOAD_BYTES = 80 * 1024 * 1024
@@ -60,18 +64,27 @@ app = Flask(
     static_folder=str(BASE_DIR / "static"),
     static_url_path="/static",
 )
+app.config["DEBUG"] = False
 DATABASE.parent.mkdir(parents=True, exist_ok=True)
-secret_file = DATABASE.parent / ".flask_secret"
-if os.environ.get("FLASK_SECRET_KEY"):
-    app.secret_key = os.environ["FLASK_SECRET_KEY"]
+secret_key = os.environ.get("FLASK_SECRET_KEY")
+if secret_key:
+    app.secret_key = secret_key
+elif IS_RENDER:
+    raise RuntimeError("FLASK_SECRET_KEY must be set in the Render environment.")
 else:
+    secret_file = DATABASE.parent / ".flask_secret"
     if not secret_file.exists():
         secret_file.write_text(secrets.token_hex(32), encoding="utf-8")
     app.secret_key = secret_file.read_text(encoding="utf-8").strip()
 app.config["MAX_CONTENT_LENGTH"] = MAX_UPLOAD_REQUEST_BYTES
 app.config["SESSION_COOKIE_HTTPONLY"] = True
 app.config["SESSION_COOKIE_SAMESITE"] = "Lax"
-app.config["SESSION_COOKIE_SECURE"] = os.environ.get("COOKIE_SECURE", "0") == "1"
+app.config["SESSION_COOKIE_SECURE"] = os.environ.get("COOKIE_SECURE", "1" if IS_RENDER else "0") == "1"
+
+
+def development_debug_enabled():
+    """Allow the Werkzeug debugger only for explicitly enabled local development."""
+    return not IS_RENDER and os.environ.get("FLASK_DEBUG", "").lower() in {"1", "true", "yes"}
 
 
 def get_csrf_token():
@@ -140,7 +153,7 @@ def initialize_database():
                 "design_charge": "REAL NOT NULL DEFAULT 0", "discount_percent": "REAL NOT NULL DEFAULT 0",
                 "featured": "INTEGER NOT NULL DEFAULT 0", "photo_views_json": "TEXT NOT NULL DEFAULT '{}'",
                 "model_file": "TEXT NOT NULL DEFAULT ''", "model_license": "TEXT NOT NULL DEFAULT ''",
-                "print_surfaces_json": "TEXT NOT NULL DEFAULT '{}'",
+                "print_surfaces_json": "TEXT NOT NULL DEFAULT '{}'", "photo_print_areas_json": "TEXT NOT NULL DEFAULT '{}'",
             }.items():
                 if name not in product_columns:
                     db.execute(f"ALTER TABLE products ADD COLUMN {name} {definition}")
@@ -199,6 +212,34 @@ def settings_map():
     return {row["key"]: row["value"] for row in connect_db().execute("SELECT key,value FROM site_settings")}
 
 
+def homepage_banners_from_settings(settings):
+    """Decode the independently managed homepage promotional banners."""
+    try:
+        banners = json.loads(settings.get("homepage_banners", "[]"))
+    except (TypeError, ValueError):
+        return []
+    if not isinstance(banners, list):
+        return []
+    return [banner for banner in banners if isinstance(banner, dict)
+            and isinstance(banner.get("id"), str)
+            and isinstance(banner.get("image"), str)
+            and isinstance(banner.get("title"), str)
+            and isinstance(banner.get("url"), str)]
+
+
+def validate_homepage_banner_url(value):
+    value = (value or "").strip()[:500]
+    if not value:
+        return "/products"
+    if value.startswith("/") and not value.startswith("//") and "\\" not in value:
+        return value
+    from urllib.parse import urlsplit
+    parsed = urlsplit(value)
+    if parsed.scheme in {"http", "https"} and parsed.netloc and not parsed.username and not parsed.password:
+        return value
+    raise ValueError("Banner link must be a site path or a valid http/https URL.")
+
+
 def setting_price(key, fallback=0):
     try:
         return max(0, float(settings_map().get(key, fallback)))
@@ -235,6 +276,14 @@ def cart_total(items):
     return sum(float(item["unit_price"]) * int(item["quantity"]) for item in items)
 
 
+def finite_number(value, default=0.0):
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        return float(default)
+    return number if math.isfinite(number) else float(default)
+
+
 def studio_catalog(rows=None):
     rows = rows if rows is not None else product_rows()
     color_slugs = {"tshirt", "mug", "pillow", "phonecase", "gift"}
@@ -251,6 +300,7 @@ def studio_catalog(rows=None):
             "print_areas": [{"id": key, "label": label} for key, label in PRINT_AREAS.get(row["slug"], [("front", "Front panel")])],
             "product_image": row["image"] or "",
             "photos": json.loads(row["photo_views_json"] or "{}") if "photo_views_json" in row.keys() else {},
+            "photo_print_areas": json.loads(row["photo_print_areas_json"] or "{}") if "photo_print_areas_json" in row.keys() else {},
             "model_file": row["model_file"] or "" if "model_file" in row.keys() else "",
             "model_license": row["model_license"] or "" if "model_license" in row.keys() else "",
             "print_surfaces": json.loads(row["print_surfaces_json"] or "{}") if "print_surfaces_json" in row.keys() else {},
@@ -295,6 +345,7 @@ def home():
     return render_template("index.html", products=rows, featured_products=(featured or rows)[:4], selected=get_product("tshirt"),
                            sizes=sizes_for_product(get_product("tshirt")), printing_charge=setting_price("printing_charge",PRINTING_CHARGE),
                            hero_title=settings.get("hero_title","Your Ideas. Your Design. Your Style."),hero_subtitle=settings.get("hero_subtitle","Turn your favourite photos and creative ideas into beautiful custom printed products."),promo_text=settings.get("promo_text","Made for your moments."),settings_banner=settings.get("banner_image","images/storefront-banner-reference.png"),
+                           homepage_banners=homepage_banners_from_settings(settings),
                            studio_catalog=studio_catalog(rows), max_artworks=MAX_PHOTOS_PER_PRODUCT,
                            max_create_total_mb=MAX_TOTAL_UPLOAD_BYTES // (1024 * 1024))
 
@@ -385,6 +436,12 @@ def add_to_cart():
         settings_list = json.loads(settings_raw)
         if not isinstance(settings_list, list):
             raise ValueError("Invalid artwork settings")
+        design_snapshot = json.loads(request.form.get("design_snapshot", "{}"))
+        if not isinstance(design_snapshot, dict):
+            raise ValueError("Invalid design snapshot")
+        requested_view = design_snapshot.get("view", "front")
+        if requested_view not in {"front", "back", "left", "right", "side", "detail"}:
+            raise ValueError("Choose a supported product view.")
         normalized = []
         total_size = 0
         for index, image in enumerate(images):
@@ -438,15 +495,22 @@ def add_to_cart():
                 if not isinstance(text_spec.get("bold"), bool) or not isinstance(text_spec.get("italic"), bool):
                     raise ValueError("Text style settings are invalid.")
                 text_spec = {"text": text.strip(), "font": font, "color": color, "size": int(font_size),
-                             "bold": text_spec["bold"], "italic": text_spec["italic"]}
+                             "bold": text_spec["bold"], "italic": text_spec["italic"],
+                             "alignment": "center"}
             normalized.append({
                 "file": image, "ext": ext,
                 "size": size, "width": width, "height": height,
                 "location": location,
-                "scale": max(.3, min(3.0, float(raw.get("scale", 1)))),
-                "rotation": max(-180, min(180, float(raw.get("rotation", 0)))),
-                "offset_x": max(-100, min(100, float(raw.get("offset_x", 0)))),
-                "offset_y": max(-100, min(100, float(raw.get("offset_y", 0)))),
+                "scale": max(.3, min(3.0, finite_number(raw.get("scale", 1), 1))),
+                "rotation": max(-180, min(180, finite_number(raw.get("rotation", 0)))),
+                "offset_x": max(-10000, min(10000, finite_number(raw.get("offset_x", 0)))),
+                "offset_y": max(-10000, min(10000, finite_number(raw.get("offset_y", 0)))),
+                "position_x": max(-.5, min(.5, finite_number(raw.get("position_x", 0)))),
+                "position_y": max(-.5, min(.5, finite_number(raw.get("position_y", 0)))),
+                "view": raw.get("view") if raw.get("view") in {"front", "back", "left", "right", "side", "detail"} else requested_view,
+                "layer_order": index,
+                "layer_id": raw.get("layer_id") if isinstance(raw.get("layer_id"), str) and re.fullmatch(r"[A-Za-z0-9_-]{1,64}", raw.get("layer_id")) else secrets.token_hex(8),
+                "layer_type": "text" if text_spec else ("ready-artwork" if design_mode == "ready" else "image"),
                 "text_spec": text_spec,
             })
     except (UnidentifiedImageError, Image.DecompressionBombError, OSError, ValueError, TypeError, json.JSONDecodeError) as error:
@@ -470,8 +534,10 @@ def add_to_cart():
             entry["file"].save(target)
             if not target.is_file() or target.stat().st_size != entry["size"]:
                 raise OSError("The uploaded image was not saved completely.")
-            artworks.append({key: entry[key] for key in ("scale", "rotation", "offset_x", "offset_y", "location", "text_spec")} | {
-                "image": filename, "size": entry["size"], "width": entry["width"], "height": entry["height"],
+            artworks.append({key: entry[key] for key in ("scale", "rotation", "offset_x", "offset_y", "position_x", "position_y", "view", "layer_order", "layer_id", "layer_type", "location", "text_spec")} | {
+                "artwork_id": secrets.token_hex(12), "image": filename,
+                "original_name": secure_filename(entry["file"].filename)[:120] or f"artwork-{len(artworks) + 1}.{entry['ext']}",
+                "size": entry["size"], "width": entry["width"], "height": entry["height"],
                 "content_type": entry["file"].mimetype or f"image/{'jpeg' if entry['ext'] in {'jpg', 'jpeg'} else entry['ext']}",
             })
     except OSError:
@@ -508,7 +574,19 @@ def add_to_cart():
     undiscounted=float(product["price"])+sizes[selected_size]+printing+design_charge
     discount=round(undiscounted*discount_percent/100,2)
     unit=round(undiscounted-discount,2)
-    item = {"id": secrets.token_hex(8), "slug": slug, "name": product["name"], "image": artworks[0]["image"], "artworks": artworks,
+    item_id = secrets.token_hex(8)
+    view_angle = finite_number(design_snapshot.get("product_angle", 0))
+    item_design = {
+        "schema_version": 1, "design_id": secrets.token_hex(12), "product": slug,
+        "variant": selected_size, "color": color, "mode": design_mode,
+        "view": requested_view, "product_angle": max(-3600, min(3600, view_angle)),
+        "product_zoom": max(.7, min(1.3, finite_number(design_snapshot.get("product_zoom", 1), 1))),
+        "default_location": design_snapshot.get("default_location") if design_snapshot.get("default_location") in {key for key, _ in PRINT_AREAS.get(slug, [])} else artworks[0]["location"],
+        "print_areas": sorted({artwork["location"] for artwork in artworks}),
+        "layers": [{key: artwork[key] for key in ("artwork_id", "layer_id", "layer_order", "layer_type", "image", "original_name", "width", "height", "size", "content_type", "location", "view", "scale", "rotation", "position_x", "position_y", "text_spec")} for artwork in artworks],
+    }
+    item = {"id": item_id, "design_id": item_design["design_id"], "design": item_design,
+            "slug": slug, "name": product["name"], "image": artworks[0]["image"], "artworks": artworks,
             "design_mode": design_mode, "size": selected_size, "color": color, "quantity": quantity, "scale": scale,
             "rotation": rotation, "offset_x": offset_x, "offset_y": offset_y,
             "base_price": float(product["price"]), "size_price": sizes[selected_size],
@@ -586,11 +664,23 @@ def checkout():
             cursor = db.execute("INSERT INTO orders (customer_name,email,phone,address,items_json,total,created_at,customer_id,status,delivery_charge) VALUES (?,?,?,?,?,?,?,?,?,?)",
                 (fields["customer_name"], fields["email"], fields["phone"], fields["address"], json.dumps(items), order_total,
                  datetime.now().isoformat(timespec="seconds"), customer["id"] if customer else None, "Pending", delivery))
+            order_id = cursor.lastrowid
+            order_snapshot = json.loads(json.dumps(items))
+            for order_item in order_snapshot:
+                order_item["order_id"] = order_id
+                order_item["customer_id"] = customer["id"] if customer else None
+                design = order_item.get("design")
+                if isinstance(design, dict):
+                    design.update(order_id=order_id, customer_id=customer["id"] if customer else None)
+                for artwork in order_item.get("artworks", []):
+                    artwork["order_id"] = order_id
+                    artwork["customer_id"] = customer["id"] if customer else None
+            db.execute("UPDATE orders SET items_json=? WHERE id=?", (json.dumps(order_snapshot), order_id))
             db.commit()
         except ValueError as error:
             db.rollback();flash(str(error),"error")
             return render_template("checkout.html",items=items,total=order_total,delivery_charge=delivery,customer=customer),409
-        order_id = cursor.lastrowid; session["cart"] = []
+        session["cart"] = []
         return render_template("checkout.html", items=[], total=0, order_id=order_id, delivery_charge=0, customer=customer)
     return render_template("checkout.html", items=items, total=cart_total(items)+delivery, delivery_charge=delivery, customer=customer)
 
@@ -869,6 +959,11 @@ def admin_product_rows(db=None):
             product["photo_views"] = photo_views if isinstance(photo_views, dict) else {}
         except (ValueError, TypeError):
             product["photo_views"] = {}
+        try:
+            photo_print_areas = json.loads(row["photo_print_areas_json"] or "{}")
+            product["photo_print_areas_json"] = json.dumps(photo_print_areas if isinstance(photo_print_areas, dict) else {}, separators=(",", ":"))
+        except (ValueError, TypeError):
+            product["photo_print_areas_json"] = "{}"
         products.append(product)
     return products
 
@@ -924,6 +1019,44 @@ def save_product_photo_views(files, current=None, replace_views=()):
                 if len(views[view]) > 12:
                     raise ValueError(f"Keep no more than 12 {view} product photos.")
     return {view: paths for view, paths in views.items() if paths}
+
+
+def parse_photo_print_areas(raw, slug):
+    """Validate normalized quadrilaterals used to composite designs on product photos."""
+    if not isinstance(raw, str) or len(raw) > 12000:
+        raise ValueError("Photo print area settings are too large.")
+    try:
+        value = json.loads(raw or "{}")
+    except json.JSONDecodeError as error:
+        raise ValueError("Photo print areas must be valid JSON.") from error
+    if not isinstance(value, dict):
+        raise ValueError("Photo print areas must be a JSON object.")
+    allowed_views = set(PHOTO_VIEW_FIELDS)
+    allowed_locations = {key for key, _label in PRINT_AREAS.get(slug, [("front", "Front panel")])}
+    clean = {}
+    for view, areas in value.items():
+        if view not in allowed_views or not isinstance(areas, dict):
+            raise ValueError("Use front, back, left, right or detail as photo view keys.")
+        clean[view] = {}
+        for location, points in areas.items():
+            if location not in allowed_locations or not isinstance(points, list) or len(points) != 4:
+                raise ValueError(f"Photo print boundary for {view} must use a supported print location and four corners.")
+            polygon = []
+            for point in points:
+                if not isinstance(point, list) or len(point) != 2:
+                    raise ValueError("Each photo print boundary corner must be an [x, y] pair.")
+                x, y = point
+                if isinstance(x, bool) or isinstance(y, bool) or not isinstance(x, (int, float)) or not isinstance(y, (int, float)) or not (0 <= x <= 1 and 0 <= y <= 1):
+                    raise ValueError("Photo print boundary coordinates must be between 0 and 1.")
+                polygon.append([round(float(x), 6), round(float(y), 6)])
+            crosses = []
+            for index in range(4):
+                x1, y1 = polygon[index]; x2, y2 = polygon[(index + 1) % 4]; x3, y3 = polygon[(index + 2) % 4]
+                crosses.append((x2 - x1) * (y3 - y2) - (y2 - y1) * (x3 - x2))
+            if any(abs(cross) < 1e-6 for cross in crosses) or not (all(cross > 0 for cross in crosses) or all(cross < 0 for cross in crosses)):
+                raise ValueError("Photo print boundary corners must form a convex quadrilateral in clockwise or counter-clockwise order.")
+            clean[view][location] = polygon
+    return clean
 
 
 def delete_unused_product_assets(db, photo_paths=(), model_files=()):
@@ -1023,11 +1156,12 @@ def admin_products():
             inventory = int(request.form.get("inventory", 0))
             if inventory < 0:
                 raise ValueError("Initial stock cannot be negative.")
+            photo_print_areas = parse_photo_print_areas(request.form.get("photo_print_areas", "{}"), slug)
             photos = save_product_photo_views(request.files, {}, request.form.getlist("replace_photo_views"))
             model = save_licensed_model(request.files.get("model"), slug, request.form.get("model_license", ""))
             surfaces = parse_print_surfaces(request.form.get("print_surfaces", "{}"), slug)
-            db.execute("INSERT INTO products(slug,name,price,description,category_id,enabled,sizes_json,colors_json,inventory,printing_charge,design_charge,discount_percent,featured,photo_views_json,model_file,model_license,print_surfaces_json) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
-                       (slug,name,price,description,category_id or None,1,json.dumps(sizes),json.dumps(colors),inventory,setting_price("printing_charge",PRINTING_CHARGE),setting_price("design_charge"),0,0,json.dumps(photos),model or "",request.form.get("model_license", "").strip() if model else "",json.dumps(surfaces)))
+            db.execute("INSERT INTO products(slug,name,price,description,category_id,enabled,sizes_json,colors_json,inventory,printing_charge,design_charge,discount_percent,featured,photo_views_json,model_file,model_license,print_surfaces_json,photo_print_areas_json) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                       (slug,name,price,description,category_id or None,1,json.dumps(sizes),json.dumps(colors),inventory,setting_price("printing_charge",PRINTING_CHARGE),setting_price("design_charge"),0,0,json.dumps(photos),model or "",request.form.get("model_license", "").strip() if model else "",json.dumps(surfaces),json.dumps(photo_print_areas)))
             image=save_product_image(request.files.get("image"))
             if image:db.execute("UPDATE products SET image=? WHERE slug=?",(image,slug))
             db.commit()
@@ -1102,6 +1236,7 @@ def admin_product_edit(slug):
             old_photo_paths.extend(path for group in old_views.values() if isinstance(group,list) for path in group)
         except (ValueError,TypeError,AttributeError):pass
         old_model=product["model_file"] or ""
+        photo_print_areas = parse_photo_print_areas(request.form.get("photo_print_areas", product["photo_print_areas_json"] or "{}"), slug)
         image=save_product_image(request.files.get("image"))
         try:
             current_photos = json.loads(product["photo_views_json"] or "{}")
@@ -1112,8 +1247,8 @@ def admin_product_edit(slug):
         uploaded_model = request.files.get("model")
         model = save_licensed_model(uploaded_model, slug, model_license) if uploaded_model and uploaded_model.filename else None
         surfaces = parse_print_surfaces(request.form.get("print_surfaces", product["print_surfaces_json"] or "{}"), slug)
-        db.execute("UPDATE products SET name=?,description=?,price=?,category_id=?,sizes_json=?,colors_json=?,inventory=?,printing_charge=?,design_charge=?,discount_percent=?,enabled=?,featured=?,image=CASE WHEN ? IS NULL THEN image ELSE ? END,photo_views_json=?,model_file=CASE WHEN ? IS NULL THEN model_file ELSE ? END,model_license=CASE WHEN ? IS NULL THEN model_license ELSE ? END,print_surfaces_json=? WHERE slug=?",
-                   (name,description,price,category_id or None,json.dumps(sizes),json.dumps(colors),inventory,printing,design,discount,int(request.form.get("enabled")=="on"),int(request.form.get("featured")=="on"),image,image,json.dumps(photos),model,model,model_license if model else None,model_license if model else None,json.dumps(surfaces),slug))
+        db.execute("UPDATE products SET name=?,description=?,price=?,category_id=?,sizes_json=?,colors_json=?,inventory=?,printing_charge=?,design_charge=?,discount_percent=?,enabled=?,featured=?,image=CASE WHEN ? IS NULL THEN image ELSE ? END,photo_views_json=?,model_file=CASE WHEN ? IS NULL THEN model_file ELSE ? END,model_license=CASE WHEN ? IS NULL THEN model_license ELSE ? END,print_surfaces_json=?,photo_print_areas_json=? WHERE slug=?",
+                   (name,description,price,category_id or None,json.dumps(sizes),json.dumps(colors),inventory,printing,design,discount,int(request.form.get("enabled")=="on"),int(request.form.get("featured")=="on"),image,image,json.dumps(photos),model,model,model_license if model else None,model_license if model else None,json.dumps(surfaces),json.dumps(photo_print_areas),slug))
         db.commit()
         delete_unused_product_assets(db,old_photo_paths,([old_model] if old_model and model and model!=old_model else []))
         if image and product["image"] and image!=product["image"]:delete_unused_product_assets(db,[product["image"]])
@@ -1227,7 +1362,117 @@ def admin_order_detail(order_id):
             db.execute("UPDATE orders SET status=? WHERE id=?",(status,order_id))
         db.commit();flash("Order marked delivered and customer notified." if status=="Delivered" else "Order status updated.","success")
         return redirect(url_for("admin_order_detail",order_id=order_id))
-    return render_template("admin_order_detail.html",order=order,items=json.loads(order["items_json"]),statuses=sorted(ORDER_STATUSES),sections=ADMIN_SECTIONS)
+    try:
+        items=json.loads(order["items_json"] or "[]")
+    except (ValueError, TypeError):
+        items=[]
+    for item in items:
+        if not isinstance(item, dict):
+            continue
+        item["print_groups"]=[]
+        for surface, layers in group_artworks(item).items():
+            location,view=surface.rsplit("::",1)
+            available = True
+            for layer in layers:
+                try:
+                    name=artwork_filename(layer)
+                    path=(UPLOAD_DIR / name).resolve()
+                    layer["source_available"]=path.parent == UPLOAD_DIR.resolve() and path.is_file()
+                    if not layer["source_available"] and not isinstance(layer.get("text_spec"),dict):
+                        available=False
+                except (MissingPrintAsset, OSError):
+                    layer["source_available"]=False
+                    if not isinstance(layer.get("text_spec"),dict):
+                        available=False
+            try:
+                width,height,dpi=print_spec(item,location)
+            except ValueError:
+                width=height=dpi=0
+            design=item.get("design") if isinstance(item.get("design"),dict) else {}
+            design_id=design.get("design_id") or item.get("design_id") or item.get("id")
+            label=dict(PRINT_AREAS.get(item.get("slug"),[])).get(location,location.replace("_"," ").title())
+            item["print_groups"].append({
+                "surface":surface,"location":location,"label":label,"layers":layers,"available":available,
+                "width":width,"height":height,"dpi":dpi,"design_id":design_id,
+                "view":view,
+            })
+    return render_template("admin_order_detail.html",order=order,items=items,statuses=sorted(ORDER_STATUSES),sections=ADMIN_SECTIONS)
+
+
+def item_design_snapshot(item):
+    design=item.get("design")
+    return design if isinstance(design,dict) else {}
+
+
+def item_design_id(item):
+    return item_design_snapshot(item).get("design_id") or item.get("design_id") or item.get("id")
+
+
+def order_artwork_layer(order_id, design_id, filename):
+    order=connect_db().execute("SELECT items_json FROM orders WHERE id=?",(order_id,)).fetchone()
+    if order is None:
+        abort(404)
+    try:
+        items=json.loads(order["items_json"] or "[]")
+    except (ValueError,TypeError):
+        abort(404)
+    for item in items:
+        if not isinstance(item,dict):
+            continue
+        if item_design_id(item) != design_id:
+            continue
+        for artwork in item.get("artworks",[]):
+            try:
+                if artwork_filename(artwork) != filename:
+                    continue
+                path=(UPLOAD_DIR / filename).resolve()
+                if path.parent != UPLOAD_DIR.resolve() or not path.is_file():
+                    abort(404,"The original customer artwork is missing from storage.")
+                return artwork
+            except MissingPrintAsset:
+                continue
+    abort(404)
+
+
+@app.get("/admin/orders/<int:order_id>/artwork/<design_id>/<filename>")
+@admin_required
+def admin_order_artwork(order_id,design_id,filename):
+    artwork=order_artwork_layer(order_id,design_id,filename)
+    path=(UPLOAD_DIR / filename).resolve()
+    response=send_file(path,as_attachment=True,download_name=artwork.get("original_name") or filename,
+                       mimetype=artwork.get("content_type") or "application/octet-stream",max_age=0)
+    response.headers["Cache-Control"]="private, no-store"
+    response.headers["X-Content-Type-Options"]="nosniff"
+    return response
+
+
+@app.get("/admin/orders/<int:order_id>/print/<design_id>/<location>/<view>")
+@admin_required
+def admin_order_print(order_id,design_id,location,view):
+    order=connect_db().execute("SELECT items_json FROM orders WHERE id=?",(order_id,)).fetchone()
+    if order is None:
+        abort(404)
+    try:
+        items=json.loads(order["items_json"] or "[]")
+    except (ValueError,TypeError):
+        abort(404)
+    item=next((candidate for candidate in items if isinstance(candidate,dict) and item_design_id(candidate)==design_id),None)
+    if item is None:
+        abort(404)
+    try:
+        if view not in {"front","back","left","right","side","detail"}:
+            abort(404)
+        payload,spec=render_print_png(item,location,UPLOAD_DIR,view)
+    except MissingPrintAsset as error:
+        abort(404,str(error))
+    except ValueError as error:
+        abort(404,str(error))
+    filename=f"order-{order_id}-{item.get('slug','product')}-{location}-{view}.png"
+    response=send_file(BytesIO(payload),mimetype="image/png",as_attachment=request.args.get("inline")!="1",
+                       download_name=filename,max_age=0,conditional=False)
+    response.headers["Cache-Control"]="private, no-store"
+    response.headers["X-Content-Type-Options"]="nosniff"
+    return response
 
 
 @app.get("/admin/customers")
@@ -1243,7 +1488,42 @@ def admin_customers():
 def admin_website():
     db=connect_db()
     if request.method=="POST":
-        if request.form.get("action")=="product_flags":
+        action=request.form.get("action", "")
+        if action in {"banner_add", "banner_update", "banner_delete"}:
+            settings=settings_map()
+            banners=homepage_banners_from_settings(settings)
+            banner_id=request.form.get("banner_id", "").strip()
+            try:
+                if action=="banner_add":
+                    if len(banners)>=20:raise ValueError("You can display up to 20 homepage promotional banners.")
+                    title=request.form.get("banner_title", "").strip()[:120]
+                    if not title:raise ValueError("Enter a title for the promotional banner.")
+                    target_url=validate_homepage_banner_url(request.form.get("banner_url", ""))
+                    image=save_product_image(request.files.get("promo_banner_image"))
+                    if not image:raise ValueError("Choose a banner image to add.")
+                    banners.append({"id":secrets.token_hex(8),"title":title,"url":target_url,"image":image})
+                    message="Promotional banner added. The Print / Customize section is unchanged."
+                elif action=="banner_update":
+                    banner=next((item for item in banners if item["id"]==banner_id), None)
+                    if banner is None:raise ValueError("That promotional banner no longer exists. Refresh and try again.")
+                    title=request.form.get("banner_title", "").strip()[:120]
+                    if not title:raise ValueError("Enter a title for the promotional banner.")
+                    target_url=validate_homepage_banner_url(request.form.get("banner_url", ""))
+                    image=save_product_image(request.files.get("promo_banner_image"))
+                    banner.update({"title":title,"url":target_url})
+                    if image:banner["image"]=image
+                    message="Promotional banner updated. Other homepage content is unchanged."
+                else:
+                    remaining=[item for item in banners if item["id"]!=banner_id]
+                    if len(remaining)==len(banners):raise ValueError("That promotional banner no longer exists. Refresh and try again.")
+                    banners=remaining
+                    message="Promotional banner removed from the homepage. Its image file was retained."
+                db.execute("INSERT INTO site_settings(key,value) VALUES('homepage_banners',?) ON CONFLICT(key) DO UPDATE SET value=excluded.value",(json.dumps(banners,separators=(",",":")),))
+                db.commit();flash(message,"success")
+            except ValueError as error:
+                db.rollback();flash(str(error),"error")
+            return redirect(url_for("admin_website"))
+        if action=="product_flags":
             for product in db.execute("SELECT slug FROM products").fetchall():
                 slug=product["slug"]
                 db.execute("UPDATE products SET enabled=?,featured=? WHERE slug=?",(int(slug in request.form.getlist("visible")),int(slug in request.form.getlist("featured")),slug))
@@ -1257,7 +1537,8 @@ def admin_website():
             db.commit();flash("Homepage content saved.","success")
         except ValueError as error:db.rollback();flash(str(error),"error")
         return redirect(url_for("admin_website"))
-    return admin_render("website",settings=settings_map(),products=connect_db().execute("SELECT slug,name,featured,enabled FROM products ORDER BY name").fetchall())
+    settings=settings_map()
+    return admin_render("website",settings=settings,homepage_banners=homepage_banners_from_settings(settings),products=connect_db().execute("SELECT slug,name,featured,enabled FROM products ORDER BY name").fetchall())
 
 
 @app.route("/admin/offers",methods=["GET","POST"])
@@ -1308,9 +1589,17 @@ def uploaded_file(filename):
                 for item in json.loads(row["items_json"]):
                     if any(art.get("image")==filename for art in item.get("artworks",[])):allowed.add(filename)
         if filename not in allowed:abort(404)
-    return send_from_directory(UPLOAD_DIR, filename)
+    response=send_from_directory(UPLOAD_DIR, filename)
+    response.headers["Cache-Control"]="private, no-store"
+    response.headers["X-Content-Type-Options"]="nosniff"
+    return response
 
 
 if __name__ == "__main__":
-    app.run(debug=True)
-
+    if IS_RENDER:
+        raise SystemExit("Render production must use Gunicorn: gunicorn --bind 0.0.0.0:$PORT app:app")
+    app.run(
+        host=os.environ.get("HOST", "127.0.0.1"),
+        port=int(os.environ.get("PORT", "5000")),
+        debug=development_debug_enabled(),
+    )
