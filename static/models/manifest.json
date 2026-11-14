@@ -1,0 +1,14 @@
+{
+  "version": 1,
+  "license_policy": "Only install assets with a documented commercial license and attribution record.",
+  "products": {
+    "tshirt": {"model": null, "license": null, "print_surfaces": {"front_center":"PRINT_FRONT", "back_center":"PRINT_BACK", "left_chest":"PRINT_LEFT_CHEST", "right_chest":"PRINT_RIGHT_CHEST", "left_sleeve":"PRINT_LEFT_SLEEVE", "right_sleeve":"PRINT_RIGHT_SLEEVE"}},
+    "mug": {"model": null, "license": null, "print_surfaces": {"wrap":"PRINT_WRAP"}},
+    "pillow": {"model": null, "license": null, "print_surfaces": {"front":"PRINT_FRONT"}},
+    "banner": {"model": null, "license": null, "print_surfaces": {"full_front":"PRINT_FRONT"}},
+    "frame": {"model": null, "license": null, "print_surfaces": {"photo":"PRINT_PHOTO"}},
+    "phonecase": {"model": null, "license": null, "print_surfaces": {"back":"PRINT_BACK"}},
+    "poster": {"model": null, "license": null, "print_surfaces": {"full_front":"PRINT_FRONT"}},
+    "gift": {"model": null, "license": null, "print_surfaces": {"front":"PRINT_FRONT"}}
+  }
+}

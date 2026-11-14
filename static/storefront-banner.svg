@@ -1,0 +1,28 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1200 720" role="img" aria-labelledby="title desc">
+  <title id="title">Printed flex banner on a neighborhood storefront</title>
+  <desc id="desc">Illustrated storefront with a large installed printed advertising banner, metal eyelets and a shop entrance.</desc>
+  <defs>
+    <linearGradient id="sky" x2="0" y2="1"><stop stop-color="#d7e9f1"/><stop offset="1" stop-color="#f2e8d7"/></linearGradient>
+    <linearGradient id="wall" x2="0" y2="1"><stop stop-color="#e7d9c5"/><stop offset="1" stop-color="#b8a38b"/></linearGradient>
+    <linearGradient id="vinyl" x2="0" y2="1"><stop stop-color="#122b53"/><stop offset=".5" stop-color="#245b9a"/><stop offset="1" stop-color="#123561"/></linearGradient>
+    <linearGradient id="shade" x2="1" y2="0"><stop stop-color="#071329" stop-opacity=".34"/><stop offset=".12" stop-color="#fff" stop-opacity=".04"/><stop offset=".75" stop-color="#fff" stop-opacity="0"/><stop offset="1" stop-color="#020815" stop-opacity=".35"/></linearGradient>
+    <filter id="shadow" x="-.2" y="-.2" width="1.4" height="1.5"><feGaussianBlur stdDeviation="13"/></filter>
+  </defs>
+  <rect width="1200" height="720" fill="url(#sky)"/>
+  <path d="M0 590 1200 555v165H0z" fill="#52565b"/><path d="m0 630 1200-34" stroke="#e5d6a8" stroke-width="8" opacity=".7"/>
+  <path d="M96 190 1110 150v520L96 700z" fill="url(#wall)"/>
+  <path d="m65 190 1075-44 43 50-1082 47z" fill="#34404c"/><path d="m96 238 1014-42v22L96 260z" fill="#776754"/>
+  <g opacity=".18" stroke="#715d49" stroke-width="3"><path d="m115 300 978-42M115 335l978-42M115 370l978-42M115 405l978-42M115 440l978-42M115 475l978-42"/><path d="m240 280-10 410m250-420-8 410m250-420-7 410m250-420-4 410"/></g>
+  <ellipse cx="605" cy="313" rx="485" ry="116" fill="#16243b" opacity=".27" filter="url(#shadow)"/>
+  <path d="m112 163 979-40 19 160-991 41z" fill="#17263b"/>
+  <path d="m128 151 956-39 15 149-960 42z" fill="url(#vinyl)" stroke="#f4ead6" stroke-width="9"/>
+  <path d="m128 151 956-39 15 149-960 42z" fill="url(#shade)"/>
+  <path d="m153 170 906-36" stroke="#79a0cc" stroke-width="3" opacity=".45"/>
+  <path d="m164 257 920-38" stroke="#07142a" stroke-width="8" opacity=".32"/>
+  <g fill="#e9dfca" stroke="#748096" stroke-width="3"><circle cx="147" cy="174" r="9"/><circle cx="1072" cy="136" r="9"/><circle cx="154" cy="292" r="9"/><circle cx="1082" cy="253" r="9"/></g>
+  <text x="600" y="195" text-anchor="middle" font-family="Arial,sans-serif" font-size="29" font-weight="700" letter-spacing="8" fill="#8de7ef">YOUR BRAND</text>
+  <text x="600" y="251" text-anchor="middle" font-family="Arial,sans-serif" font-size="45" font-weight="800" letter-spacing="3" fill="#fff">PRINTED TO BE SEEN</text>
+  <rect x="205" y="402" width="355" height="265" rx="3" fill="#253341"/><rect x="222" y="419" width="321" height="236" fill="#8db9c5"/><path d="M382 419v236M222 535h321" stroke="#eee3d3" stroke-width="14"/>
+  <path d="M576 392h410v275H576z" fill="#282e36"/><path d="M597 411h368v256H597z" fill="#acb8ad"/><path d="M610 428h342v109H610z" fill="#d0d9cf"/><path d="M610 557h157v110H610z" fill="#53483e"/><path d="M784 557h168v110H784z" fill="#b6c3bf"/>
+  <path d="M95 700 1110 670v23L95 720z" fill="#4b4038"/><path d="M105 703 1110 677" stroke="#d0b792" stroke-width="6"/>
+</svg>
