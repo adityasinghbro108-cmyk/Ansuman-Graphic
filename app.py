@@ -4,6 +4,12 @@ import re
 import secrets
 import sqlite3
 import math
+import hashlib
+import hmac
+import smtplib
+import ssl
+import time
+from email.message import EmailMessage
 from io import BytesIO
 from datetime import datetime
 from pathlib import Path
@@ -142,6 +148,13 @@ def initialize_database():
             db.execute("""CREATE TABLE IF NOT EXISTS admin_users (
                 id INTEGER PRIMARY KEY AUTOINCREMENT, email TEXT NOT NULL UNIQUE,
                 password_hash TEXT NOT NULL, created_at TEXT NOT NULL)""")
+            db.execute("""CREATE TABLE IF NOT EXISTS admin_password_resets (
+                token_hash TEXT PRIMARY KEY, admin_id INTEGER NOT NULL,
+                expires_at INTEGER NOT NULL, used_at INTEGER,
+                FOREIGN KEY(admin_id) REFERENCES admin_users(id) ON DELETE CASCADE)""")
+            db.execute("""CREATE TABLE IF NOT EXISTS admin_recovery_limits (
+                bucket TEXT NOT NULL, key_hash TEXT NOT NULL, window_started INTEGER NOT NULL,
+                attempts INTEGER NOT NULL, PRIMARY KEY(bucket,key_hash))""")
             db.execute("CREATE TABLE IF NOT EXISTS categories (id INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT NOT NULL UNIQUE)")
             db.execute("CREATE TABLE IF NOT EXISTS site_settings (key TEXT PRIMARY KEY, value TEXT NOT NULL)")
             product_columns = {row[1] for row in db.execute("PRAGMA table_info(products)")}
@@ -864,6 +877,146 @@ def admin_login():
     session.clear(); session["role"]="admin"; session["admin_id"]=admin["id"]; session.permanent=True
     next_url=request.form.get("next") or request.args.get("next")
     return redirect(safe_next_url(next_url) if next_url else "/admin")
+
+
+def mail_configuration():
+    server = os.environ.get("MAIL_SERVER", "").strip()
+    sender = os.environ.get("MAIL_DEFAULT_SENDER", "").strip()
+    username = os.environ.get("MAIL_USERNAME", "").strip()
+    password = os.environ.get("MAIL_PASSWORD", "")
+    try:
+        port = int(os.environ.get("MAIL_PORT", ""))
+    except ValueError:
+        return None
+    use_tls = os.environ.get("MAIL_USE_TLS", "").strip().lower() in {"1", "true", "yes", "on"}
+    if not server or not sender or port < 1 or port > 65535 or not username or not password:
+        return None
+    return server, port, username, password, sender, use_tls
+
+
+def recovery_rate_limited(bucket, identity, limit, window_seconds):
+    """Atomically consume a database-backed fixed-window recovery attempt."""
+    now = int(time.time())
+    key_hash = hmac.new(str(app.secret_key).encode(), identity.encode(), hashlib.sha256).hexdigest()
+    db = connect_db()
+    db.execute("BEGIN IMMEDIATE")
+    row = db.execute("SELECT window_started,attempts FROM admin_recovery_limits WHERE bucket=? AND key_hash=?",
+                     (bucket, key_hash)).fetchone()
+    if row is None or now - row[0] >= window_seconds:
+        db.execute("INSERT INTO admin_recovery_limits(bucket,key_hash,window_started,attempts) VALUES(?,?,?,1) "
+                   "ON CONFLICT(bucket,key_hash) DO UPDATE SET window_started=excluded.window_started,attempts=1",
+                   (bucket, key_hash, now))
+        limited = False
+    else:
+        limited = row[1] >= limit
+        if not limited:
+            db.execute("UPDATE admin_recovery_limits SET attempts=attempts+1 WHERE bucket=? AND key_hash=?",
+                       (bucket, key_hash))
+    db.execute("DELETE FROM admin_recovery_limits WHERE window_started<?", (now - 86400,))
+    db.commit()
+    return limited
+
+
+def recovery_headers(response):
+    response = app.make_response(response)
+    response.headers["Cache-Control"] = "no-store, no-cache, must-revalidate, max-age=0"
+    response.headers["Pragma"] = "no-cache"
+    response.headers["Referrer-Policy"] = "no-referrer"
+    return response
+
+
+@app.route("/admin/forgot-password", methods=["GET", "POST"])
+def admin_forgot_password():
+    if request.method == "GET":
+        return recovery_headers(render_template("admin_forgot_password.html"))
+    email = request.form.get("email", "").strip().lower()[:254]
+    if not re.fullmatch(r"[^\s@]+@[^\s@]+\.[^\s@]+", email):
+        flash("Enter a valid email address.", "error")
+        return recovery_headers(render_template("admin_forgot_password.html")), 400
+    ip = request.remote_addr or "unknown"
+    email_identity = hashlib.sha256(email.encode()).hexdigest()
+    if recovery_rate_limited("request-ip", ip, 5, 900) or recovery_rate_limited("request-email", email_identity, 3, 900):
+        return recovery_headers(("If an admin account exists for that email, password reset instructions have been sent.", 429))
+    mail = mail_configuration()
+    if mail is None:
+        return recovery_headers(("Password reset is temporarily unavailable. Please try again later.", 503))
+    admin = connect_db().execute("SELECT id,email FROM admin_users WHERE email=?", (email,)).fetchone()
+    if admin is not None:
+        raw_token = secrets.token_urlsafe(32)
+        token_hash = hashlib.sha256(raw_token.encode("utf-8")).hexdigest()
+        db = connect_db()
+        db.execute("DELETE FROM admin_password_resets WHERE admin_id=? OR expires_at<=?", (admin["id"], int(time.time())))
+        db.execute("INSERT INTO admin_password_resets(token_hash,admin_id,expires_at) VALUES(?,?,?)",
+                   (token_hash, admin["id"], int(time.time()) + 900))
+        db.commit()
+        # URL fragments never reach the HTTP server or access logs.
+        reset_url = url_for("admin_reset_password", _external=True) + "#" + raw_token
+        message = EmailMessage()
+        message["Subject"] = "ANSUMAN GRAPHIC admin password reset"
+        message["From"] = mail[4]
+        message["To"] = admin["email"]
+        message.set_content(f"A password reset was requested for your admin account. Use this link within 15 minutes:\n\n{reset_url}\n\nIf you did not request this, you can ignore this email.")
+        try:
+            with smtplib.SMTP(mail[0], mail[1], timeout=15) as smtp:
+                smtp.ehlo()
+                if mail[5]:
+                    smtp.starttls(context=ssl.create_default_context())
+                    smtp.ehlo()
+                smtp.login(mail[2], mail[3])
+                smtp.send_message(message)
+        except (OSError, smtplib.SMTPException):
+            db.execute("DELETE FROM admin_password_resets WHERE token_hash=?", (token_hash,))
+            db.commit()
+            app.logger.warning("Admin password reset email delivery failed")
+            flash("We could not send the reset email. Please try again later.", "error")
+            return recovery_headers(("Password reset is temporarily unavailable. Please try again later.", 503))
+    flash("If an admin account exists for that email, password reset instructions have been sent.", "success")
+    return recovery_headers(redirect(url_for("admin_forgot_password")))
+
+
+@app.route("/admin/reset-password", methods=["GET", "POST"])
+def admin_reset_password():
+    db = connect_db()
+    if request.method == "GET":
+        token_hash = session.get("admin_reset_token_hash", "")
+        reset = db.execute("SELECT admin_id FROM admin_password_resets WHERE token_hash=? AND used_at IS NULL AND expires_at>?",
+                           (token_hash, int(time.time()))).fetchone() if token_hash else None
+        return recovery_headers((render_template("admin_reset_password.html", invalid=reset is None), 200 if reset else 400))
+    token = request.form.get("token", "")[:200]
+    if token:
+        token_hash = hashlib.sha256(token.encode("utf-8")).hexdigest()
+        limited = recovery_rate_limited("token-ip", request.remote_addr or "unknown", 10, 3600)
+        limited = recovery_rate_limited("token", token_hash, 5, 3600) or limited
+        if limited:
+            return recovery_headers(("Too many recovery attempts. Request a new reset link later.", 429))
+        reset = db.execute(
+            "SELECT admin_id FROM admin_password_resets WHERE token_hash=? AND used_at IS NULL AND expires_at>?",
+            (token_hash, int(time.time()))).fetchone()
+        if reset is None:
+            return recovery_headers(("This reset link is invalid, expired, or already used.", 400))
+        session["admin_reset_token_hash"] = token_hash
+        return recovery_headers(redirect(url_for("admin_reset_password")))
+    token_hash = session.get("admin_reset_token_hash", "")
+    if recovery_rate_limited("submit-ip", request.remote_addr or "unknown", 10, 3600):
+        return recovery_headers(("Password reset could not be completed. Request a new reset link.", 429))
+    password = request.form.get("password", "")
+    confirmation = request.form.get("confirm_password", "")
+    if password != confirmation or len(password) < 12 or not any(c.isalpha() for c in password) or not any(c.isdigit() for c in password):
+        flash("Passwords must match and contain at least 12 characters, including a letter and a number.", "error")
+        return recovery_headers((render_template("admin_reset_password.html", invalid=False), 400))
+    db.execute("BEGIN IMMEDIATE")
+    reset = db.execute("SELECT admin_id FROM admin_password_resets WHERE token_hash=? AND used_at IS NULL AND expires_at>?",
+                       (token_hash, int(time.time()))).fetchone()
+    if reset is None:
+        db.rollback()
+        session.pop("admin_reset_token_hash", None)
+        return recovery_headers((render_template("admin_reset_password.html", invalid=True), 400))
+    db.execute("UPDATE admin_users SET password_hash=? WHERE id=?", (generate_password_hash(password), reset["admin_id"]))
+    db.execute("UPDATE admin_password_resets SET used_at=? WHERE token_hash=?", (int(time.time()), token_hash))
+    db.commit()
+    session.pop("admin_reset_token_hash", None)
+    flash("Your password has been reset. Sign in with your new password.", "success")
+    return recovery_headers(redirect(url_for("admin_login")))
 
 
 @app.cli.command("create-admin")

@@ -357,6 +357,84 @@ class StudioFlowTests(unittest.TestCase):
         self.assertEqual(json.loads(preserved[0]),json.loads(existing[0]))
         self.assertEqual(json.loads(preserved[1]),json.loads(existing[1]))
 
+    def test_admin_forgot_password_token_is_hashed_expires_once_and_resets_password(self):
+        self.create_admin()
+        sent = {}
+        class FakeSMTP:
+            def __init__(self, *args, **kwargs): pass
+            def __enter__(self): return self
+            def __exit__(self, *args): pass
+            def ehlo(self): pass
+            def starttls(self, **kwargs): pass
+            def login(self, *args): pass
+            def send_message(self, message): sent["message"] = message
+        mail_env = {"MAIL_SERVER":"smtp.example.com", "MAIL_PORT":"587", "MAIL_USERNAME":"sender",
+                    "MAIL_PASSWORD":"smtp-secret", "MAIL_DEFAULT_SENDER":"sender@example.com", "MAIL_USE_TLS":"true"}
+        with patch.dict("os.environ", mail_env), patch.object(website.smtplib, "SMTP", FakeSMTP):
+            sent_response = self.request("POST", "/admin/forgot-password", data={"email":"shop@example.com"})
+            self.assertEqual(sent_response.status_code, 302)
+            unknown_response = self.request("POST", "/admin/forgot-password", data={"email":"missing@example.com"})
+            self.assertEqual(unknown_response.status_code, 302)
+            self.assertEqual(sent_response.request.path, unknown_response.request.path)
+            self.assertEqual(sent_response.location, unknown_response.location)
+        body = sent["message"].get_content()
+        token = re.search(r"/admin/reset-password#([^\s]+)", body).group(1)
+        token_hash = website.hashlib.sha256(token.encode("utf-8")).hexdigest()
+        with closing(sqlite3.connect(website.DATABASE)) as db:
+            row = db.execute("SELECT token_hash,expires_at,used_at FROM admin_password_resets").fetchone()
+        self.assertEqual(row[0], token_hash)
+        self.assertNotEqual(row[0], token)
+        self.assertGreaterEqual(row[1], int(website.time.time()) + 899)
+        self.assertIsNone(row[2])
+        reset_page = self.request("GET", "/admin/reset-password")
+        self.assertEqual(reset_page.status_code, 400)
+        self.assertEqual(reset_page.headers["Cache-Control"].split(",")[0], "no-store")
+        self.assertEqual(reset_page.headers["Referrer-Policy"], "no-referrer")
+        exchanged = self.request("POST", "/admin/reset-password", data={"token":token})
+        self.assertEqual(exchanged.status_code, 302)
+        reset_page = self.request("GET", "/admin/reset-password")
+        self.assertEqual(reset_page.status_code, 200)
+        password = "new-admin-password-456"
+        changed = self.request("POST", "/admin/reset-password", data={"password":password,"confirm_password":password})
+        self.assertEqual(changed.status_code, 302)
+        self.assertEqual(changed.location, "/admin/login")
+        with closing(sqlite3.connect(website.DATABASE)) as db:
+            password_hash,used_at=db.execute("SELECT a.password_hash,r.used_at FROM admin_users a JOIN admin_password_resets r ON r.admin_id=a.id").fetchone()
+        self.assertTrue(website.check_password_hash(password_hash,password))
+        self.assertIsNotNone(used_at)
+        reused = self.request("POST", "/admin/reset-password", data={"password":password,"confirm_password":password})
+        self.assertEqual(reused.status_code,400)
+        login = self.request("POST", "/admin/login", data={"email":"shop@example.com","password":password})
+        self.assertEqual(login.status_code,302)
+
+    def test_admin_forgot_password_missing_smtp_and_expired_token_rejected(self):
+        self.create_admin()
+        empty_mail = {key:"" for key in ("MAIL_SERVER","MAIL_PORT","MAIL_USERNAME","MAIL_PASSWORD","MAIL_DEFAULT_SENDER","MAIL_USE_TLS")}
+        with patch.dict("os.environ", empty_mail):
+            unavailable=self.request("POST","/admin/forgot-password",data={"email":"shop@example.com"})
+        self.assertEqual(unavailable.status_code,503)
+        self.assertIn(b"temporarily unavailable",unavailable.data)
+        with closing(sqlite3.connect(website.DATABASE)) as db:
+            db.execute("INSERT INTO admin_password_resets(token_hash,admin_id,expires_at) VALUES(?,?,?)",
+                       (website.hashlib.sha256(b"expired-test-token").hexdigest(),1,int(website.time.time())-1))
+            db.commit()
+        expired=self.request("POST","/admin/reset-password",data={"token":"expired-test-token"})
+        self.assertEqual(expired.status_code,400)
+        self.assertIn(b"expired",expired.data)
+
+    def test_admin_recovery_rate_limits_and_rejects_invalid_token(self):
+        with patch.object(website, "mail_configuration", return_value=("smtp.example.com",587,"sender","secret","sender@example.com",True)):
+            statuses = [self.request("POST", "/admin/forgot-password", data={"email":f"person{i}@example.com"}).status_code for i in range(6)]
+        self.assertEqual(statuses[:5], [302] * 5)
+        self.assertEqual(statuses[5], 429)
+        invalid = [self.request("POST", "/admin/reset-password", data={"token":f"invalid-token-{i}"}).status_code for i in range(11)]
+        self.assertEqual(invalid[:10], [400] * 10)
+        self.assertEqual(invalid[10], 429)
+
+    def test_admin_recovery_post_requires_csrf(self):
+        response = self.client.post("/admin/reset-password", data={"token":"no-token"})
+        self.assertEqual(response.status_code, 400)
+
     def test_admin_product_photo_views_are_managed_and_publicly_configured(self):
         self.create_admin()
         self.request("POST","/admin/login",data={"email":"shop@example.com","password":"separate-admin-secret-123"})
@@ -1117,7 +1195,8 @@ class StudioFlowTests(unittest.TestCase):
     def test_deployment_templates_assets_and_wsgi_import_target(self):
         template_names={
             "_design_editor.html", "account_orders.html", "admin.html", "admin_login.html",
-            "admin_order_detail.html", "cart.html", "checkout.html", "design.html", "index.html",
+            "admin_forgot_password.html", "admin_order_detail.html", "admin_reset_password.html",
+            "cart.html", "checkout.html", "design.html", "index.html",
             "login.html", "order_detail.html", "products.html", "profile.html", "register.html",
         }
         self.assertEqual(set(website.app.jinja_env.list_templates()),template_names)
